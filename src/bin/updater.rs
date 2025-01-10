@@ -50,8 +50,24 @@ use probe_rs::{
     Permissions,
 };
 
+fn print_usage() {
+    println!("Modem Updater Usage:");
+    println!("  updater <operation> <firmware_path>");
+    println!("\nOperations:");
+    println!("  verify   - Verify firmware at the specified path");
+    println!("  program  - Program and verify firmware at the specified path");
+    println!("\nExample:");
+    println!("  updater program _bin/mfw_nrf91x1_2.0.2.zip");
+}
+
 fn main() {
     env_logger::init();
+
+    // Check if any arguments were provided
+    if std::env::args().len() < 3 {
+        print_usage();
+        std::process::exit(1);
+    }
 
     let lister = Lister::new();
     let mut probe;
@@ -104,6 +120,8 @@ fn main() {
     } else if operation == "program" {
         updater.program_and_verify(&path).unwrap();
     } else {
-        panic!("Unknown operation: {}", operation);
+        println!("\nError: Unknown operation '{}'", operation);
+        print_usage();
+        std::process::exit(1);
     }
 }

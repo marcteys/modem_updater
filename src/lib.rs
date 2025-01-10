@@ -41,6 +41,31 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//! Modem firmware update utility for nRF91 Series
+//!
+//! This crate provides functionality to update modem firmware on nRF91 Series devices
+//! using probe-rs for debugging interface access. It supports both verification and
+//! programming operations.
+//!
+//! # Example
+//! ```no_run
+//! use probe_rs::{
+//!     probe::{list::Lister, DebugProbeSelector},
+//!     Permissions,
+//! };
+//! use modem_updater::ModemUpdater;
+//!
+//! let lister = Lister::new();
+//! let probe = lister.open(DebugProbeSelector {
+//!     vendor_id: 0x2e8a,
+//!     product_id: 0x000c,
+//!     serial_number: None,
+//! }).unwrap();
+//! let mut session = probe.attach("nRF9160_xxAA", Permissions::new().allow_erase_all()).unwrap();
+//! let mut updater = ModemUpdater::new(&mut session);
+//! updater.program_and_verify("modem_update.zip").unwrap();
+//! ```
+
 use bin_file::BinFile;
 use chrono::Utc;
 use probe_rs::flashing::{self};
@@ -54,15 +79,22 @@ use std::time::Duration;
 use tempfile::TempDir;
 use zip::read::ZipArchive;
 
+/// Maximum time in seconds to wait for mass erase operation
 const MASS_ERASE_TIMEOUT: i64 = 30;
 
+/// Address of the fault event register
 const FAULT_EVENT: u64 = 0x4002A100;
+/// Address of the command event register  
 const COMMAND_EVENT: u64 = 0x4002A108;
+/// Address of the data event register
 const DATA_EVENT: u64 = 0x4002A110;
 
+/// Maximum buffer size for pipelined operations
 const IPC_PIPELINED_MAX_BUFFER_SIZE: usize = 0xE000;
+/// Maximum buffer size for non-pipelined operations
 const IPC_MAX_BUFFER_SIZE: usize = 0x10000;
 
+/// Main struct for performing modem firmware updates
 pub struct ModemUpdater<'a> {
     session: &'a mut Session,
     pipelined: bool,
@@ -70,32 +102,26 @@ pub struct ModemUpdater<'a> {
     firmware_update_digest: Option<String>,
 }
 
-// def bytes_to_word(bts):
-//     result = 0
-//     for i, b in enumerate(bts):
-//         result |= b << (8*i)
-//     return result
+/// Converts a byte slice into a 32-bit word using little-endian ordering
 fn bytes_to_word(bts: &[u8]) -> u32 {
     let mut result: u32 = 0;
-
     for (i, b) in bts.iter().enumerate() {
         result |= (*b as u32) << (8 * i);
     }
-
     result
 }
 
+/// Changes the endianness of a 32-bit word, operating on n bytes
 fn change_endianness(x: u32, n: u32) -> u32 {
     let mut result = 0;
-
     for i in 0..n {
         result |= ((x >> (8 * i)) & 0xFF) << (8 * (n - i - 1));
     }
-
     result
 }
 
 impl<'a> ModemUpdater<'a> {
+    /// Creates a new ModemUpdater instance
     pub fn new(session: &'a mut Session) -> Self {
         Self {
             session,
@@ -105,6 +131,15 @@ impl<'a> ModemUpdater<'a> {
         }
     }
 
+    /// Verifies the modem firmware from a zip file without programming
+    ///
+    /// # Arguments
+    /// * `mfw_zip` - Path to the modem firmware zip file
+    ///
+    /// # Returns
+    /// * `Ok(true)` if verification succeeded
+    /// * `Ok(false)` if verification failed
+    /// * `Err` if an error occurred during verification
     pub fn verify(&mut self, mfw_zip: &str) -> Result<bool, io::Error> {
         let mut result = false;
 
@@ -135,6 +170,14 @@ impl<'a> ModemUpdater<'a> {
         Ok(result)
     }
 
+    /// Programs and verifies modem firmware from a zip file
+    ///
+    /// # Arguments
+    /// * `mfw_zip` - Path to the modem firmware zip file
+    ///
+    /// # Returns
+    /// * `Ok(())` if programming and verification succeeded
+    /// * `Err` if an error occurred during programming or verification
     pub fn program_and_verify(&mut self, mfw_zip: &str) -> Result<(), io::Error> {
         // Get temporary directory
         let temp_dir = TempDir::new().unwrap();
@@ -170,6 +213,7 @@ impl<'a> ModemUpdater<'a> {
         Ok(())
     }
 
+    /// Reads the key digest from the device
     fn read_key_digest(&mut self) -> Result<String, io::Error> {
         self.wait_and_ack_events()?;
 
@@ -178,6 +222,10 @@ impl<'a> ModemUpdater<'a> {
         Ok(format!("{:08X}", digest_data)[..7].to_string())
     }
 
+    /// Programs a single firmware segment
+    ///
+    /// # Arguments
+    /// * `segment` - Path to the segment file to program
     fn program_segment(&mut self, segment: &PathBuf) -> Result<(), io::Error> {
         let bufsz = if self.pipelined {
             IPC_PIPELINED_MAX_BUFFER_SIZE
@@ -225,6 +273,11 @@ impl<'a> ModemUpdater<'a> {
         Ok(())
     }
 
+    /// Writes a chunk of data to device RAM
+    ///
+    /// # Arguments
+    /// * `data` - Data chunk to write
+    /// * `bank` - Bank number for pipelined operations
     fn write_chunk(&mut self, data: &[u8], bank: u32) {
         let ram_address = if self.pipelined {
             0x2000001C + IPC_PIPELINED_MAX_BUFFER_SIZE * bank as usize
@@ -247,6 +300,12 @@ impl<'a> ModemUpdater<'a> {
         core.write_32(ram_address as u64, &data_words).unwrap();
     }
 
+    /// Commits a written chunk to flash memory
+    ///
+    /// # Arguments
+    /// * `addr` - Target flash address
+    /// * `data_len` - Length of data to commit
+    /// * `bank` - Bank number for pipelined operations
     fn commit_chunk(&mut self, addr: u32, data_len: usize, bank: u32) {
         // Get the core
         let mut core = self.session.core(0).unwrap();
@@ -268,6 +327,7 @@ impl<'a> ModemUpdater<'a> {
         core.write_word_32(0x4002A004, 1).unwrap();
     }
 
+    /// Internal verification function
     fn _verify(&mut self) -> Result<bool, io::Error> {
         let mut ranges_to_verify = Vec::new();
         for s in self.segments.values() {
@@ -343,6 +403,11 @@ impl<'a> ModemUpdater<'a> {
         Ok(false)
     }
 
+    /// Waits for and acknowledges device events
+    ///
+    /// # Returns
+    /// * `Ok(())` if events were received and acknowledged
+    /// * `Err` if a timeout or error occurred
     fn wait_and_ack_events(&mut self) -> Result<(), io::Error> {
         // Loop until we get an ACK or NACK with timeout
         let start = Utc::now().timestamp_millis();
@@ -408,6 +473,9 @@ impl<'a> ModemUpdater<'a> {
         Ok(())
     }
 
+    /// Sets up the device for firmware operations
+    ///
+    /// Configures UICR settings, IPC, and RAM for firmware updates
     fn setup_device(&mut self) {
         let mut target = self.session.core(0).unwrap();
 
@@ -458,6 +526,11 @@ impl<'a> ModemUpdater<'a> {
         target.write_word_32(0x50005610, 0).unwrap();
     }
 
+    /// Processes the firmware zip file and extracts necessary components
+    ///
+    /// # Arguments
+    /// * `mfw_zip` - Path to the firmware zip file
+    /// * `temp_dir` - Temporary directory for extracted files
     fn process_zip_file(&mut self, mfw_zip: &str, temp_dir: &TempDir) -> Result<(), io::Error> {
         // Unzip to temp dir
         let file = File::open(mfw_zip).unwrap();
