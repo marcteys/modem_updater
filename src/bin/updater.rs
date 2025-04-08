@@ -61,9 +61,9 @@ fn print_usage() {
 }
 
 fn main() {
+    std::env::set_var("RUST_BACKTRACE", "1");
     env_logger::init();
 
-    // Check if any arguments were provided
     if std::env::args().len() < 3 {
         print_usage();
         std::process::exit(1);
@@ -72,56 +72,62 @@ fn main() {
     let lister = Lister::new();
     let mut probe;
 
-    // First argument is the operation (verify or program)
     let operation = std::env::args().nth(1).expect("Operation not provided!");
+    let path = std::env::args().nth(2).expect("Firmware path not provided!");
 
-    // Get second arguement as path to firmware
-    let path = std::env::args()
-        .nth(2)
-        .expect("Firmware path not provided!");
-
-    // Get probe with timeout
     let start = Utc::now().timestamp_millis();
     loop {
-        probe = match lister.open(DebugProbeSelector {
+        match lister.open(DebugProbeSelector {
             vendor_id: 0x2e8a,
             product_id: 0x000c,
             serial_number: None,
         }) {
-            Ok(p) => p,
+            Ok(p) => {
+                probe = p;
+                break;
+            }
             Err(_e) => {
                 let now = Utc::now().timestamp_millis();
                 if now > start + 2000 {
-                    panic!("Unable to get probe!");
+                    eprintln!("Unable to get probe within timeout.");
+                    std::process::exit(1);
                 } else {
                     thread::sleep(Duration::from_millis(100));
-                    continue;
                 }
             }
-        };
-
-        break;
+        }
     }
 
-    // Set speed
-    probe.set_speed(12000).unwrap();
+    if let Err(e) = probe.set_speed(12000) {
+        eprintln!("Failed to set probe speed: {}", e);
+        std::process::exit(1);
+    }
 
-    // Attach
     let mut session = match probe.attach("nRF9160_xxAA", Permissions::new().allow_erase_all()) {
         Ok(s) => s,
-        Err(e) => panic!("Unable to attach to probe! Error: {}", e),
+        Err(e) => {
+            eprintln!("Unable to attach to probe: {}", e);
+            std::process::exit(1);
+        }
     };
 
     // Get updater
     let mut updater = ModemUpdater::new(&mut session);
 
-    if operation == "verify" {
-        updater.verify(&path).unwrap();
-    } else if operation == "program" {
-        updater.program_and_verify(&path).unwrap();
-    } else {
-        println!("\nError: Unknown operation '{}'", operation);
-        print_usage();
+    let result = match operation.as_str() {
+        "verify" => updater.verify(&path).map(|_| ()),
+        "program" => updater.program_and_verify(&path),
+        _ => {
+            eprintln!("Unknown operation '{}'", operation);
+            print_usage();
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = result {
+        eprintln!("Operation '{}' failed: {}", operation, e);
         std::process::exit(1);
     }
+
+    println!("Operation '{}' completed successfully.", operation);
 }
